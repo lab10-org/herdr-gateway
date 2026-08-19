@@ -1,0 +1,105 @@
+name: agent-task
+
+# Lanza una tarea en herdr-gateway (VPS sandbox) a través de Tailscale.
+#
+# Secrets requeridos (repo u organización):
+#   TS_OAUTH_CLIENT_ID  - OAuth client de Tailscale (scope devices:core, tag:ci)
+#   TS_OAUTH_SECRET     - secret del OAuth client
+#   GATEWAY_TOKEN       - Bearer token del gateway
+#
+# Requisitos en la consola de Tailscale:
+#   - OAuth client con tag tag:ci
+#   - ACL recomendada: { "action": "accept", "src": ["tag:ci"], "dst": ["100.93.130.60:4040"] }
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Tarea para el agente"
+        required: true
+      repo:
+        description: "Path del repo en la VPS"
+        required: true
+        default: "/root/herdr-gateway"
+      agent_kind:
+        description: "Agente"
+        required: true
+        default: "claude"
+        type: choice
+        options: [claude, pi]
+      timeout_minutes:
+        description: "Timeout esperando al agente"
+        required: true
+        default: "20"
+
+env:
+  GATEWAY: http://100.93.130.60:4040
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Create task
+        id: create
+        env:
+          TOKEN: ${{ secrets.GATEWAY_TOKEN }}
+          PROMPT: ${{ github.event.inputs.prompt }}
+          REPO: ${{ github.event.inputs.repo }}
+          AGENT_KIND: ${{ github.event.inputs.agent_kind }}
+        run: |
+          BODY=$(jq -n --arg p "$PROMPT" --arg r "$REPO" --arg k "$AGENT_KIND" \
+            '{prompt: $p, repo: $r, agent_kind: $k}')
+          TASK=$(curl -sf -X POST "$GATEWAY/tasks" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "content-type: application/json" \
+            -d "$BODY")
+          echo "$TASK" | jq '{id, status, worktree, branch}'
+          echo "task_id=$(echo "$TASK" | jq -r .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for completion
+        id: wait
+        env:
+          TOKEN: ${{ secrets.GATEWAY_TOKEN }}
+          TIMEOUT_MIN: ${{ github.event.inputs.timeout_minutes }}
+        run: |
+          ID="${{ steps.create.outputs.task_id }}"
+          MAX=$(( TIMEOUT_MIN * 6 ))   # iteraciones de 10s
+          for i in $(seq 1 "$MAX"); do
+            JSON=$(curl -sf "$GATEWAY/tasks/$ID" -H "Authorization: Bearer $TOKEN")
+            STATUS=$(echo "$JSON" | jq -r .status)
+            echo "[$i/$MAX] $STATUS"
+            case "$STATUS" in
+              done)    exit 0 ;;
+              blocked) echo "::warning::agente bloqueado (requiere aprobación humana en Herdr)"; exit 1 ;;
+              error)   echo "$JSON" | jq -r .error; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::timeout esperando a la tarea $ID"
+          exit 1
+
+      - name: Fetch agent output
+        if: always()
+        env:
+          TOKEN: ${{ secrets.GATEWAY_TOKEN }}
+        run: |
+          ID="${{ steps.create.outputs.task_id }}"
+          curl -sf "$GATEWAY/tasks/$ID/output?lines=300" -H "Authorization: Bearer $TOKEN" \
+            | jq -r .output > agent-output.txt || true
+          tail -60 agent-output.txt || true
+
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-output-${{ steps.create.outputs.task_id }}
+          path: agent-output.txt
+          if-no-files-found: ignore

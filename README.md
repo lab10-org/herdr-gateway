@@ -23,6 +23,9 @@ Cada tarea:
 | `WEBHOOK_URL` | — | Webhook global (si la tarea no define uno) |
 | `POLL_INTERVAL_MS` | `5000` | Intervalo de sondeo de estados |
 | `SESSION_IDLE_TTL_MS` | `7200000` (2h) | Tiempo que la sesión del agente queda abierta para follow-ups tras `done` |
+| `CLEANUP_INTERVAL_MS` | `3600000` (1h) | Intervalo del cleanup de recursos idle |
+| `CLEANUP_IDLE_MS` | `86400000` (24h) | Antigüedad sin interacción para que el cleanup elimine recursos |
+| `STATE_FILE` | `/root/.herdr/gateway-state.json` | Estado persistido (tareas + repos conocidos) |
 
 ## API
 
@@ -76,7 +79,25 @@ Notas:
 Transcripción reciente del agente (recent-unwrapped).
 
 ### `DELETE /tasks/:id`
-Cierra el tab en Herdr y elimina el worktree (mantiene la rama).
+Cierra el tab en Herdr, elimina el worktree y borra la rama local.
+
+## Cleanup automático
+
+Cada `CLEANUP_INTERVAL_MS` (1h por defecto) el gateway barre los recursos que llevan
+más de `CLEANUP_IDLE_MS` (24h) sin interacción:
+
+1. **Tareas conocidas** en estado `done` | `error` | `blocked` → cierra el tab,
+   elimina el worktree y borra la rama local. Nunca toca tareas `working`/`starting`.
+2. **Worktrees huérfanos** (`WORKTREE_ROOT/*/task-t-*`, p. ej. olvidados tras un
+   reinicio): usa el mtime del dir como última actividad; si el repo origen ya no
+   existe, borra el dir directamente. También cierra el tab asociado por label.
+3. **Ramas stale** `task/t-*` sin tarea viva ni worktree que las use, con tip commit
+   más viejo que el umbral.
+
+La "última interacción" de una tarea es su `updated_at` (cambios de estado,
+mensajes de follow-up, eventos). El estado se persiste en `STATE_FILE` en cada
+evento, así el cleanup funciona aunque el gateway se reinicie. El cleanup corre
+una primera vez ~1 min después del arranque y luego cada intervalo.
 
 ## Webhooks
 

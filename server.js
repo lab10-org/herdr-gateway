@@ -19,8 +19,10 @@ const config = {
   worktreeRoot: process.env.WORKTREE_ROOT || "/root/.herdr/worktrees",
   globalWebhook: process.env.WEBHOOK_URL || "",
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS || 5000),
-  maxTaskAgeMs: Number(process.env.MAX_TASK_AGE_MS || 24 * 3600 * 1000),
   sessionIdleTtlMs: Number(process.env.SESSION_IDLE_TTL_MS || 2 * 3600 * 1000),
+  cleanupIntervalMs: Number(process.env.CLEANUP_INTERVAL_MS || 3600 * 1000),
+  cleanupIdleMs: Number(process.env.CLEANUP_IDLE_MS || 24 * 3600 * 1000),
+  stateFile: process.env.STATE_FILE || "/root/.herdr/gateway-state.json",
 };
 
 // ---------- Helpers ----------
@@ -39,6 +41,7 @@ const newId = () => "t-" + crypto.randomBytes(4).toString("hex");
 // ---------- State ----------
 /** @type {Map<string, object>} */
 const tasks = new Map();
+const knownRepos = new Set();
 let workspaceId = null;
 
 async function ensureWorkspace() {
@@ -96,6 +99,7 @@ async function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookU
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
   tasks.set(id, task);
+  knownRepos.add(repo);
   log(task, `worktree created at ${wtPath} (base ${sync.baseRef})`);
 
   // 3. Tab in the dedicated workspace -> pane -> agent -> prompt
@@ -117,9 +121,28 @@ async function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookU
 }
 
 function httpError(code, msg) { return Object.assign(new Error(msg), { code }); }
+
+// ---------- Persistence (survive restarts so cleanup can find old tasks) ----------
+function saveState() {
+  try {
+    fs.mkdirSync(path.dirname(config.stateFile), { recursive: true });
+    fs.writeFileSync(config.stateFile, JSON.stringify({ tasks: [...tasks.values()], repos: [...knownRepos] }, null, 1));
+  } catch (e) { console.error("[state]", e.message); }
+}
+function loadState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(config.stateFile, "utf8"));
+    const list = Array.isArray(data) ? data : data.tasks || []; // legacy: bare array
+    for (const t of list) if (t && t.id) tasks.set(t.id, t);
+    for (const r of data.repos || []) knownRepos.add(r);
+    if (tasks.size) console.log(`[state] restored ${tasks.size} task(s)`);
+  } catch { /* no state file yet */ }
+}
+
 function log(task, msg) {
   task.events.push({ at: new Date().toISOString(), msg });
   task.updatedAt = new Date().toISOString();
+  saveState();
 }
 function setStatus(task, status) {
   if (task.status === status) return;
@@ -183,12 +206,114 @@ async function pollAgents() {
       }
     }
   }
-  // GC old terminal tasks
+}
+
+// ---------- Hourly cleanup: idle >24h resources (tabs, worktrees, branches) ----------
+const CLEANABLE = new Set(["done", "error", "blocked"]);
+
+async function destroyResources(task) {
+  const errors = [];
+  if (task.tabId) {
+    try { await herdr(["tab", "close", task.tabId]); } catch (e) { errors.push(e.message); }
+  }
+  try { await git(task.repo, ["worktree", "remove", "--force", task.worktree]); } catch (e) { errors.push(e.message); }
+  if (task.branch) {
+    try { await git(task.repo, ["branch", "-D", task.branch]); } catch (e) { errors.push(e.message); }
+  }
+  return errors;
+}
+
+async function cleanup() {
+  const now = Date.now();
+  let removed = 0;
+
+  // 1. Known tasks: terminal/blocked and idle beyond threshold
   for (const [id, task] of tasks) {
-    if (TERMINAL.has(task.status) && Date.now() - new Date(task.updatedAt) > config.maxTaskAgeMs) {
-      tasks.delete(id);
+    if (!CLEANABLE.has(task.status)) continue;
+    if (now - new Date(task.updatedAt) <= config.cleanupIdleMs) continue;
+    const errors = await destroyResources(task);
+    tasks.delete(id);
+    removed++;
+    console.log(`[cleanup] task ${id} (${task.status}) removed`, errors.length ? `errors: ${errors.join("; ")}` : "");
+  }
+
+  // 2. Orphans: worktree dirs task-t-* with no live task (e.g. after a restart
+  //    with an older state file) whose dir mtime exceeds the idle threshold.
+  let tabLabels = new Map();
+  try {
+    const ws = await ensureWorkspace();
+    const tabs = await herdr(["tab", "list", "--workspace", ws]);
+    for (const t of tabs.tabs || []) tabLabels.set(t.label, t.tab_id);
+  } catch { /* herdr unavailable; skip tab closing for orphans */ }
+
+  for (const t of tasks.values()) knownRepos.add(t.repo);
+  if (config.defaultRepo) knownRepos.add(config.defaultRepo);
+
+  let repoDirs = [];
+  try { repoDirs = fs.readdirSync(config.worktreeRoot); } catch { /* no root yet */ }
+  for (const repoName of repoDirs) {
+    const repoPath = path.join(config.worktreeRoot, repoName);
+    let entries = [];
+    try { entries = fs.readdirSync(repoPath); } catch { continue; }
+    for (const entry of entries) {
+      const m = entry.match(/^task-(t-[0-9a-f]+)$/);
+      if (!m || tasks.has(m[1])) continue;
+      const wtPath = path.join(repoPath, entry);
+      let mtime;
+      try { mtime = fs.statSync(wtPath).mtimeMs; } catch { continue; }
+      if (now - mtime <= config.cleanupIdleMs) continue;
+      // Resolve the real repo from the worktree's gitdir pointer
+      let repo = null;
+      try {
+        const gitdir = fs.readFileSync(path.join(wtPath, ".git"), "utf8");
+        const gm = gitdir.match(/gitdir: (.+)\/\.git\/worktrees\//);
+        if (gm) repo = gm[1];
+      } catch { continue; }
+      if (repo) knownRepos.add(repo);
+      if (repo && fs.existsSync(repo)) {
+        const errors = await destroyResources({
+          repo, worktree: wtPath, branch: `task/${m[1]}`, tabId: tabLabels.get(m[1]) || null,
+        });
+        removed++;
+        console.log(`[cleanup] orphan ${m[1]} removed`, errors.length ? `errors: ${errors.join("; ")}` : "");
+      } else {
+        // Origin repo is gone: drop the stale dir and tab directly.
+        try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch { /* ignore */ }
+        const tabId = tabLabels.get(m[1]);
+        if (tabId) { try { await herdr(["tab", "close", tabId]); } catch { /* ignore */ } }
+        removed++;
+        console.log(`[cleanup] orphan ${m[1]} removed (origin repo missing)`);
+      }
     }
   }
+
+  // 3. Stale branches: task/t-* with no live task, tip commit older than the idle threshold
+  for (const repo of knownRepos) {
+    if (!fs.existsSync(repo)) continue;
+    let refs;
+    try {
+      refs = await git(repo, ["for-each-ref", "refs/heads/task", "--format", "%(refname:short) %(committerdate:unix)"]);
+    } catch { continue; }
+    for (const line of refs.split("\n").filter(Boolean)) {
+      const [branch, ts] = line.split(" ");
+      const id = branch.replace(/^task\//, "");
+      if (tasks.has(id)) continue;
+      if (now - Number(ts) * 1000 <= config.cleanupIdleMs) continue;
+      // Only delete if no worktree still uses it
+      let inUse = false;
+      try {
+        const wts = await git(repo, ["worktree", "list", "--porcelain"]);
+        inUse = wts.includes(`refs/heads/${branch}`);
+      } catch { continue; }
+      if (inUse) continue;
+      try {
+        await git(repo, ["branch", "-D", branch]);
+        removed++;
+        console.log(`[cleanup] stale branch ${branch} deleted`);
+      } catch (e) { console.log(`[cleanup] stale branch ${branch}: ${e.message}`); }
+    }
+  }
+  if (removed) saveState();
 }
 
 // ---------- HTTP ----------
@@ -270,22 +395,23 @@ app.get("/tasks/:id/output", async (req, res) => {
   }
 });
 
-// Optional cleanup: close tab + remove worktree (keeps branch)
+// Manual cleanup: close tab + remove worktree + delete branch
 app.delete("/tasks/:id", async (req, res) => {
   const task = tasks.get(req.params.id);
   if (!task) return res.status(404).json({ error: "not found" });
-  const errors = [];
-  if (task.tabId) {
-    try { await herdr(["tab", "close", task.tabId]); } catch (e) { errors.push(e.message); }
-  }
-  try { await git(task.repo, ["worktree", "remove", "--force", task.worktree]); } catch (e) { errors.push(e.message); }
+  const errors = await destroyResources(task);
   tasks.delete(task.id);
+  saveState();
   res.json({ deleted: task.id, errors });
 });
 
 // ---------- Boot ----------
+loadState();
 ensureWorkspace()
   .then(() => {
+    setInterval(() => cleanup().catch((e) => console.error("[cleanup]", e.message)), config.cleanupIntervalMs);
+    setTimeout(() => cleanup().catch((e) => console.error("[cleanup]", e.message)), 60000);
+
     setInterval(() => pollAgents().catch((e) => console.error("[poll]", e.message)), config.pollIntervalMs);
     app.listen(config.port, config.host, () => console.log(`[gateway] listening on ${config.host}:${config.port}`));
   })

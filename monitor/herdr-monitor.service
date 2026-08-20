@@ -1,0 +1,26 @@
+[Unit]
+Description=Herdr host metrics monitor (disk/RAM/load -> journald every 10s)
+Documentation=https://github.com/lab10-org/herdr-gateway
+After=network.target
+# Independiente del gateway: si éste muere, el monitor sigue logeando
+
+[Service]
+Type=simple
+Environment=INTERVAL=10
+Environment=WORKTREE_ROOT=/root/.herdr/worktrees
+ExecStart=/root/herdr-gateway/monitor/monitor.sh
+Restart=always
+RestartSec=3
+
+# Aislamiento básico (no necesita red ni escribir fuera de /tmp)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# Todo va a journald con tag del unit
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

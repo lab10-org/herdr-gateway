@@ -81,6 +81,26 @@ Transcripción reciente del agente (recent-unwrapped).
 ### `DELETE /tasks/:id`
 Cierra el tab en Herdr, elimina el worktree y borra la rama local.
 
+## Encolamiento
+
+`POST /tasks` nunca arranca recursos directamente: crea un registro ligero
+(`queued`, sin worktree/tab/agente) y un dispatcher síncrono arranca las tareas
+más antiguas mientras `in_flight < MAX_IN_FLIGHT`.
+
+- **In-flight** = `dispatching` | `starting` | `working` | `blocked`.
+- **FIFO**: orden de inserción (sobrevive reinicios vía `STATE_FILE`).
+- El slot se libera al llegar a `done`/`error` (o al borrar la tarea) y se
+  despacha la siguiente inmediatamente.
+- **Follow-ups** (`POST /tasks/:id/messages`) no consumen slot: el cap limita
+  arranques de agentes nuevos, no mensajes a sesiones ya vivas.
+- Tareas `queued` que superen `CLEANUP_IDLE_MS` sin despachar expiran con
+  `error: "expired in queue"` + webhook (nunca desaparecen en silencio).
+- Tras un reinicio, tareas persistidas a medio arrancar (`dispatching`,
+  `starting`, `created` legacy) se reconcilian: vuelven a `queued` (reintento
+  idempotente, reusa worktree si quedó creado) o pasan a `error`.
+- `MAX_IN_FLIGHT` inválido → warning en log y default 4 (nunca desactiva el cap
+  en silencio).
+
 ## Cleanup automático
 
 Cada `CLEANUP_INTERVAL_MS` (1h por defecto) el gateway barre los recursos que llevan

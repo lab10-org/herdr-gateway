@@ -23,7 +23,15 @@ const config = {
   cleanupIntervalMs: Number(process.env.CLEANUP_INTERVAL_MS || 3600 * 1000),
   cleanupIdleMs: Number(process.env.CLEANUP_IDLE_MS || 24 * 3600 * 1000),
   stateFile: process.env.STATE_FILE || "/root/.herdr/gateway-state.json",
+  maxInFlight: Number(process.env.MAX_IN_FLIGHT || 4),
 };
+if (!Number.isInteger(config.maxInFlight) || config.maxInFlight < 0) {
+  console.error(`[config] invalid MAX_IN_FLIGHT "${process.env.MAX_IN_FLIGHT}", using default 4`);
+  config.maxInFlight = 4;
+}
+if (config.maxInFlight === 0) {
+  console.warn("[config] MAX_IN_FLIGHT=0: dispatch paused, tasks will pile up in queue");
+}
 
 // ---------- Helpers ----------
 async function herdr(args, { raw = false } = {}) {
@@ -65,7 +73,13 @@ async function ensureWorkspace() {
 }
 
 // ---------- Task lifecycle ----------
-async function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookUrl }) {
+// Tasks are enqueued as lightweight records (status "queued", no resources).
+// Resources (worktree/tab/agent) are only created on dispatch, so a burst of
+// POSTs never overwhelms the host. In-flight = dispatching|starting|working|blocked.
+const IN_FLIGHT = new Set(["dispatching", "starting", "working", "blocked"]);
+const inFlightCount = () => [...tasks.values()].filter((t) => IN_FLIGHT.has(t.status)).length;
+
+function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookUrl }) {
   const id = newId();
   repo = repo || config.defaultRepo;
   if (!repo) throw httpError(400, "repo is required (or set DEFAULT_REPO)");
@@ -73,6 +87,37 @@ async function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookU
   agentKind = agentKind || config.defaultAgentKind;
   agentArgs = agentArgs || config.defaultAgentArgs;
   branch = branch || `task/${id}`;
+
+  const task = {
+    id, prompt, repo, branch, worktree: null,
+    agentKind, agentArgs, status: "queued", events: [], webhookUrl,
+    tabId: null, paneId: null, promptSubmitted: false, error: null,
+    doneAt: null, sessionClosed: false,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  tasks.set(id, task);
+  knownRepos.add(repo);
+  log(task, "enqueued");
+  return task;
+}
+
+// Start the oldest queued tasks while in-flight < MAX_IN_FLIGHT.
+// Synchronous: "dispatching" occupies a slot immediately and startTask runs
+// fire-and-forget, so no reentrancy is possible (single-threaded JS) and all
+// free slots fill in parallel instead of serially awaiting slow agent boots.
+function dispatchQueue() {
+  if (config.maxInFlight <= 0) return; // dispatch disabled
+  for (const task of tasks.values()) {
+    if (inFlightCount() >= config.maxInFlight) break;
+    if (task.status !== "queued") continue;
+    task.status = "dispatching";
+    log(task, "dispatching");
+    startTask(task).catch((e) => fail(task, e.message));
+  }
+}
+
+async function startTask(task) {
+  const { id, prompt, repo, branch, agentKind, agentArgs } = task;
 
   // 1. Sync origin main (best-effort pull of the main checkout, always fetch)
   const sync = { fetched: false, pulled: false, baseRef: "main" };
@@ -86,38 +131,39 @@ async function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookU
     sync.baseRef = "origin/main";
   } catch { /* no origin; fall back to local main */ }
 
-  // 2. Create worktree from fresh base
+  // 2. Create worktree from fresh base (idempotent: reuse a leftover from a
+  //    crashed previous dispatch instead of dying with "branch already exists")
   const repoName = path.basename(repo);
   const wtPath = path.join(config.worktreeRoot, repoName, branch.replaceAll("/", "-"));
-  await git(repo, ["worktree", "add", "-b", branch, wtPath, sync.baseRef]);
-
-  const task = {
-    id, prompt, repo, branch, worktree: wtPath,
-    agentKind, status: "created", events: [], webhookUrl,
-    tabId: null, paneId: null, promptSubmitted: false, error: null,
-    doneAt: null, sessionClosed: false,
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-  };
-  tasks.set(id, task);
-  knownRepos.add(repo);
-  log(task, `worktree created at ${wtPath} (base ${sync.baseRef})`);
+  if (fs.existsSync(wtPath)) {
+    log(task, `reusing existing worktree ${wtPath}`);
+  } else {
+    await git(repo, ["worktree", "add", "-b", branch, wtPath, sync.baseRef]);
+    log(task, `worktree created at ${wtPath} (base ${sync.baseRef})`);
+  }
+  task.worktree = wtPath;
 
   // 3. Tab in the dedicated workspace -> pane -> agent -> prompt
-  try {
-    const ws = await ensureWorkspace();
-    const tab = await herdr(["tab", "create", "--workspace", ws, "--cwd", wtPath, "--label", id, "--no-focus"]);
-    task.tabId = tab.tab.tab_id;
-    task.paneId = tab.root_pane.pane_id;
-    await herdr(["agent", "start", id, "--kind", agentKind, "--pane", task.paneId, "--", ...agentArgs]);
-    setStatus(task, "starting");
-    // agent prompt resolves once a lifecycle change is observed (~working)
-    herdr(["agent", "prompt", id, prompt])
-      .then(() => { task.promptSubmitted = true; setStatus(task, "working"); })
-      .catch((e) => fail(task, `prompt failed: ${e.message}`));
-  } catch (e) {
-    fail(task, e.message);
+  const ws = await ensureWorkspace();
+  const tab = await herdr(["tab", "create", "--workspace", ws, "--cwd", wtPath, "--label", id, "--no-focus"]);
+  task.tabId = tab.tab.tab_id;
+  task.paneId = tab.root_pane.pane_id;
+  await herdr(["agent", "start", id, "--kind", agentKind, "--pane", task.paneId, "--", ...agentArgs]);
+  setStatus(task, "starting");
+  // agent prompt resolves once a lifecycle change is observed (~working)
+  herdr(["agent", "prompt", id, prompt])
+    .then(() => { task.promptSubmitted = true; setStatus(task, "working"); })
+    .catch((e) => fail(task, `prompt failed: ${e.message}`));
+  // The task may have been deleted/cleaned up while we were starting: don't
+  // leave a live agent over a destroyed worktree.
+  if (!tasks.has(task.id)) {
+    await destroyResources(task);
+    cleanupLog("aborted_dispatch", {
+      id: task.id, repo: task.repo, branch: task.branch, worktree: task.worktree,
+      deleted: ["tab:" + task.tabId, "worktree:" + task.worktree, "branch:" + task.branch],
+      errors: [],
+    });
   }
-  return task;
 }
 
 function httpError(code, msg) { return Object.assign(new Error(msg), { code }); }
@@ -139,6 +185,29 @@ function loadState() {
   } catch { /* no state file yet */ }
 }
 
+// Reconcile persisted tasks after a restart: crash mid-dispatch leaves zombies
+// that would occupy in-flight slots forever (nobody polls promptSubmitted:false).
+function reconcileState() {
+  for (const t of tasks.values()) {
+    if (t.status === "created" || t.status === "dispatching") {
+      // pre-queue legacy / crash mid-start: resources may or may not exist
+      t.status = "queued";
+      t.promptSubmitted = false;
+      log(t, "reconciled after restart -> queued (will retry idempotently)");
+    } else if (t.status === "starting") {
+      t.error = "gateway restarted during agent start";
+      t.status = "error";
+      log(t, "reconciled after restart -> error");
+    } else if (t.status === "working" && !t.promptSubmitted) {
+      t.error = "gateway restarted while submitting prompt";
+      t.status = "error";
+      log(t, "reconciled after restart -> error");
+    } else if (t.status === "working" || t.status === "blocked") {
+      log(t, "reconciled after restart; poll will refresh status");
+    }
+  }
+}
+
 function log(task, msg) {
   task.events.push({ at: new Date().toISOString(), msg });
   task.updatedAt = new Date().toISOString();
@@ -151,6 +220,8 @@ function setStatus(task, status) {
   else task.doneAt = null;
   log(task, `status -> ${status}`);
   notify(task);
+  // A slot freed up -> start the next queued task.
+  if (!IN_FLIGHT.has(status)) dispatchQueue();
 }
 function fail(task, msg) {
   task.error = msg;
@@ -190,7 +261,8 @@ async function pollAgents() {
       if (state === "blocked") setStatus(task, "blocked");
       else if (state === "idle" || state === "done") setStatus(task, "done");
     } catch {
-      // agent name cleared -> process exited
+      // agent name cleared -> process exited (e.g. after a gateway restart
+      // the agent may still run; poll simply cannot find it by name)
       if (task.status === "working") setStatus(task, "done");
       else if (task.status === "blocked") setStatus(task, "done");
     }
@@ -249,6 +321,21 @@ async function cleanup() {
       worktree: task.worktree, prompt: (task.prompt || "").slice(0, 120),
       created_at: task.createdAt, updated_at: task.updatedAt,
       idle_hours: +(idleMs / 3600000).toFixed(2), deleted, errors,
+    });
+  }
+
+  // 1b. Tasks stuck in queue too long (dispatch paused, huge backlog): expire
+  //     with an explicit error + webhook instead of vanishing silently.
+  for (const [id, task] of tasks) {
+    if (task.status !== "queued") continue;
+    if (now - new Date(task.createdAt) <= config.cleanupIdleMs) continue;
+    fail(task, "expired in queue (never dispatched)");
+    removed++;
+    cleanupLog("queue_expired", {
+      id, repo: task.repo, branch: task.branch, prompt: (task.prompt || "").slice(0, 120),
+      created_at: task.createdAt,
+      queued_hours: +((now - new Date(task.createdAt)) / 3600000).toFixed(2),
+      deleted: [], errors: [],
     });
   }
 
@@ -344,6 +431,7 @@ async function cleanup() {
     }
   }
   if (removed) saveState();
+  dispatchQueue();
 }
 
 // ---------- HTTP ----------
@@ -360,27 +448,45 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const publicTask = (t) => ({
-  id: t.id, status: t.status, prompt: t.prompt, repo: t.repo, branch: t.branch,
-  worktree: t.worktree, agent_kind: t.agentKind, error: t.error,
-  created_at: t.createdAt, updated_at: t.updatedAt, events: t.events,
-});
+const queuedList = () => [...tasks.values()].filter((t) => t.status === "queued");
+
+const publicTask = (t, queued) => {
+  const q = queued || queuedList();
+  return {
+    id: t.id, status: t.status, prompt: t.prompt, repo: t.repo, branch: t.branch,
+    worktree: t.worktree, agent_kind: t.agentKind, error: t.error,
+    queue_position: t.status === "queued" ? q.indexOf(t) + 1 : null,
+    created_at: t.createdAt, updated_at: t.updatedAt, events: t.events,
+  };
+};
 
 app.post("/tasks", async (req, res) => {
   const { prompt, repo, agent_kind, agent_args, branch, webhook_url } = req.body || {};
   if (!prompt || typeof prompt !== "string") return res.status(400).json({ error: "prompt is required" });
   try {
-    const task = await createTask({
+    const task = createTask({
       prompt, repo, agentKind: agent_kind, agentArgs: agent_args, branch, webhookUrl: webhook_url,
     });
+    dispatchQueue();
     res.status(201).json(publicTask(task));
   } catch (e) {
     res.status(e.code || 500).json({ error: e.message });
   }
 });
 
+app.get("/queue", (_req, res) => {
+  const inFlight = [...tasks.values()].filter((t) => IN_FLIGHT.has(t.status));
+  res.json({
+    max_in_flight: config.maxInFlight,
+    in_flight: inFlight.length,
+    in_flight_by_status: inFlight.reduce((acc, t) => ({ ...acc, [t.status]: (acc[t.status] || 0) + 1 }), {}),
+    queued: queuedList().map((t) => publicTask(t, queuedList())),
+  });
+});
+
 app.get("/tasks", (_req, res) => {
-  res.json({ tasks: [...tasks.values()].map(publicTask) });
+  const q = queuedList();
+  res.json({ tasks: [...tasks.values()].map((t) => publicTask(t, q)) });
 });
 
 app.get("/tasks/:id", async (req, res) => {
@@ -395,6 +501,9 @@ app.post("/tasks/:id/messages", async (req, res) => {
   if (!task) return res.status(404).json({ error: "not found" });
   const { message } = req.body || {};
   if (!message || typeof message !== "string") return res.status(400).json({ error: "message is required" });
+  if (task.status === "queued" || task.status === "dispatching") {
+    return res.status(409).json({ error: "task is still queued; wait for it to start" });
+  }
   if (task.sessionClosed) return res.status(409).json({ error: "session closed (idle TTL reached); create a new task" });
   if (!task.promptSubmitted) return res.status(409).json({ error: "agent is busy with a previous message" });
   try {
@@ -425,10 +534,23 @@ app.get("/tasks/:id/output", async (req, res) => {
   }
 });
 
-// Manual cleanup: close tab + remove worktree + delete branch
+// Manual cleanup: close tab + remove worktree + delete branch.
+// Note: MAX_IN_FLIGHT caps task STARTS, not active agents: follow-up messages
+// on done tasks re-enter "working" without consuming a queue slot (the agent
+// already exists; nothing new is spawned).
 app.delete("/tasks/:id", async (req, res) => {
   const task = tasks.get(req.params.id);
   if (!task) return res.status(404).json({ error: "not found" });
+  if (task.status === "queued") {
+    // No resources exist yet; just drop it from the queue.
+    tasks.delete(task.id);
+    saveState();
+    cleanupLog("manual_delete", {
+      id: task.id, status: task.status, repo: task.repo, branch: task.branch,
+      worktree: null, deleted: [], errors: [],
+    });
+    return res.json({ deleted: task.id, removed: [], errors: [] });
+  }
   const { deleted, errors } = await destroyResources(task);
   cleanupLog("manual_delete", {
     id: task.id, status: task.status, repo: task.repo, branch: task.branch,
@@ -436,17 +558,21 @@ app.delete("/tasks/:id", async (req, res) => {
   });
   tasks.delete(task.id);
   saveState();
+  dispatchQueue();
   res.json({ deleted: task.id, removed: deleted, errors });
 });
 
 // ---------- Boot ----------
 loadState();
+reconcileState();
 ensureWorkspace()
   .then(() => {
     setInterval(() => cleanup().catch((e) => console.error("[cleanup]", e.message)), config.cleanupIntervalMs);
     setTimeout(() => cleanup().catch((e) => console.error("[cleanup]", e.message)), 60000);
 
     setInterval(() => pollAgents().catch((e) => console.error("[poll]", e.message)), config.pollIntervalMs);
+    dispatchQueue(); // drain persisted queue
+    console.log(`[gateway] max in flight: ${config.maxInFlight}`);
     app.listen(config.port, config.host, () => console.log(`[gateway] listening on ${config.host}:${config.port}`));
   })
   .catch((e) => { console.error("[boot]", e); process.exit(1); });

@@ -6,7 +6,8 @@ After=network.target
 Type=simple
 WorkingDirectory=/root/herdr-gateway
 Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOST=100.93.130.60
+# HOST: 127.0.0.1 (pública vía Caddy/Cloudflare) | 100.93.130.60 (solo Tailscale)
+Environment=HOST=127.0.0.1
 Environment=PORT=4040
 Environment=HERDR_SOCKET_PATH=/root/.config/herdr/herdr.sock
 Environment=GATEWAY_TOKEN=REPLACE_WITH_STRONG_TOKEN

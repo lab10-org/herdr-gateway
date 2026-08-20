@@ -60,6 +60,11 @@ POST JSON a `webhook_url` en cada transición de estado:
 {"task_id":"t-...","status":"done","error":null,"branch":"task/t-...","worktree":"...","updated_at":"..."}
 ```
 
+## Exposición
+
+Endpoint público: `https://devbox.lab10.ai` (Cloudflare proxied → Caddy → 127.0.0.1:4040).
+Caddyfile versionado en `caddy/Caddyfile`. Detalles y checklist de seguridad en `RUNBOOK.md §1b`.
+
 ## Systemd
 
 ```bash

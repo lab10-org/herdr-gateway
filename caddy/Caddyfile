@@ -1,0 +1,26 @@
+# Reverse proxy público para herdr-gateway (Cloudflare -> Caddy -> loopback)
+# Instalado en /etc/caddy/Caddyfile. Cualquier cambio: editar aquí (repo),
+# copiar a /etc/caddy y `systemctl reload caddy`.
+devbox.lab10.ai {
+	# Solo loopback: el gateway no se expone directo
+	reverse_proxy 127.0.0.1:4040
+
+	# Cabeceras mínimas de seguridad
+	header {
+		X-Frame-Options DENY
+		X-Content-Type-Options nosniff
+		-Server
+	}
+
+	# Tamaño máximo de body razonable para prompts (1 MiB)
+	request_body {
+		max_size 1MB
+	}
+
+	# Rate limiting: hacerlo en Cloudflare (WAF/rate rules), el proxy
+	# ve solo tráfico edge. El gateway no tiene límite de concurrencia
+	# propio, así que una regla en CF es la defensa principal.
+	log {
+		format json
+	}
+}

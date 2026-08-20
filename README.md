@@ -135,3 +135,14 @@ cp herdr-gateway.service /etc/systemd/system/
 # editar Environment= al gusto
 systemctl enable --now herdr-gateway
 ```
+
+## Skill para coding agents
+
+`skills/herdr-gateway-ops` enseña al agente (pi, Claude, ...) a consultar el estado
+de la máquina, alertas, cleanups y tareas (scripts en `scripts/`, detalles en
+`references/runbook.md`). Instálalo con un symlink al directorio global de skills:
+
+```bash
+ln -s /root/herdr-gateway/skills/herdr-gateway-ops ~/.pi/agent/skills/herdr-gateway-ops
+# o para Claude Code: ~/.claude/skills/
+```

@@ -20,6 +20,7 @@ const config = {
   globalWebhook: process.env.WEBHOOK_URL || "",
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS || 5000),
   maxTaskAgeMs: Number(process.env.MAX_TASK_AGE_MS || 24 * 3600 * 1000),
+  sessionIdleTtlMs: Number(process.env.SESSION_IDLE_TTL_MS || 2 * 3600 * 1000),
 };
 
 // ---------- Helpers ----------
@@ -91,6 +92,7 @@ async function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookU
     id, prompt, repo, branch, worktree: wtPath,
     agentKind, status: "created", events: [], webhookUrl,
     tabId: null, paneId: null, promptSubmitted: false, error: null,
+    doneAt: null, sessionClosed: false,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
   tasks.set(id, task);
@@ -122,6 +124,8 @@ function log(task, msg) {
 function setStatus(task, status) {
   if (task.status === status) return;
   task.status = status;
+  if (status === "done") task.doneAt = Date.now();
+  else task.doneAt = null;
   log(task, `status -> ${status}`);
   notify(task);
 }
@@ -166,6 +170,17 @@ async function pollAgents() {
       // agent name cleared -> process exited
       if (task.status === "working") setStatus(task, "done");
       else if (task.status === "blocked") setStatus(task, "done");
+    }
+  }
+  // Close idle session tabs after TTL so follow-ups have a bounded window.
+  for (const task of tasks.values()) {
+    if (task.status === "done" && !task.sessionClosed && task.doneAt
+        && Date.now() - task.doneAt > config.sessionIdleTtlMs) {
+      task.sessionClosed = true;
+      log(task, "session idle TTL reached; closing tab");
+      if (task.tabId) {
+        try { await herdr(["tab", "close", task.tabId]); } catch { /* already closed */ }
+      }
     }
   }
   // GC old terminal tasks
@@ -217,6 +232,30 @@ app.get("/tasks/:id", async (req, res) => {
   const task = tasks.get(req.params.id);
   if (!task) return res.status(404).json({ error: "not found" });
   res.json(publicTask(task));
+});
+
+// Follow-up message on the same agent session (conversation continues in-context).
+app.post("/tasks/:id/messages", async (req, res) => {
+  const task = tasks.get(req.params.id);
+  if (!task) return res.status(404).json({ error: "not found" });
+  const { message } = req.body || {};
+  if (!message || typeof message !== "string") return res.status(400).json({ error: "message is required" });
+  if (task.sessionClosed) return res.status(409).json({ error: "session closed (idle TTL reached); create a new task" });
+  if (!task.promptSubmitted) return res.status(409).json({ error: "agent is busy with a previous message" });
+  try {
+    const info = await herdr(["agent", "get", task.id]);
+    const state = (info.agent || info).agent_status || "unknown";
+    if (state === "working") return res.status(409).json({ error: "agent is busy" });
+  } catch {
+    return res.status(409).json({ error: "agent process is no longer running; create a new task" });
+  }
+  log(task, `follow-up message (${message.length} chars)`);
+  task.promptSubmitted = false;
+  setStatus(task, "working");
+  herdr(["agent", "prompt", task.id, message])
+    .then(() => { task.promptSubmitted = true; })
+    .catch((e) => fail(task, `follow-up failed: ${e.message}`));
+  res.status(202).json(publicTask(task));
 });
 
 app.get("/tasks/:id/output", async (req, res) => {

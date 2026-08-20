@@ -22,6 +22,7 @@ Cada tarea:
 | `WORKTREE_ROOT` | `/root/.herdr/worktrees` | Raíz de worktrees |
 | `WEBHOOK_URL` | — | Webhook global (si la tarea no define uno) |
 | `POLL_INTERVAL_MS` | `5000` | Intervalo de sondeo de estados |
+| `SESSION_IDLE_TTL_MS` | `7200000` (2h) | Tiempo que la sesión del agente queda abierta para follow-ups tras `done` |
 
 ## API
 
@@ -45,7 +46,31 @@ Estado actual + historial de eventos.
 
 Estados: `created` → `starting` → `working` → `done` | `blocked` | `error`.
 
-`blocked` = el agente pide aprobación/input (revísalo en Herdr o mándale input por su pane).
+`blocked` = el agente pide aprobación/input (respóndele con `POST /tasks/:id/messages`
+o directamente en su pane de Herdr).
+
+### `POST /tasks/:id/messages`
+Continúa la conversación de una tarea: envía un mensaje de seguimiento al **mismo agente**
+(misma sesión, mismo worktree/branch, contexto completo del diálogo previo).
+
+```json
+{ "message": "Now add tests for that fix" }
+```
+→ `202` con la tarea; el ciclo vuelve a `working` → `done` | `blocked`, disparando
+webhooks como en una tarea nueva. Se puede encadenar cualquier número de mensajes.
+
+Errores:
+- `400` — falta `message`.
+- `404` — tarea inexistente.
+- `409` — el agente está ocupado con un mensaje anterior, la sesión expiró
+  (idle TTL tras `done`, ver `SESSION_IDLE_TTL_MS`) o el proceso ya no corre.
+  En esos casos, crea una tarea nueva.
+
+Notas:
+- También funciona cuando la tarea está `blocked`: el mensaje se entrega como input
+  al agente (p. ej. una aprobación).
+- Tras `done`, la sesión permanece disponible durante `SESSION_IDLE_TTL_MS`;
+  pasado ese tiempo el tab se cierra automáticamente.
 
 ### `GET /tasks/:id/output?lines=200`
 Transcripción reciente del agente (recent-unwrapped).

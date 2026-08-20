@@ -99,6 +99,23 @@ mensajes de follow-up, eventos). El estado se persiste en `STATE_FILE` en cada
 evento, así el cleanup funciona aunque el gateway se reinicie. El cleanup corre
 una primera vez ~1 min después del arranque y luego cada intervalo.
 
+### Logs del cleanup
+
+Cada recurso eliminado deja **una línea JSON** en journald (`journalctl -u herdr-gateway | grep '\[cleanup\]'`)
+con el detalle exacto de lo borrado:
+
+```json
+{"at":"...","kind":"task","id":"t-e5cd...","status":"done","repo":"/root/lab10/lab10",
+ "branch":"task/t-e5cd...","worktree":"/root/.herdr/worktrees/lab10/task-t-e5cd...",
+ "prompt":"...","idle_hours":24.3,
+ "deleted":["tab:wB:tB","worktree:/root/.herdr/...","branch:task/t-e5cd..."],"errors":[]}
+```
+
+`kind` puede ser: `task` (tarea conocida), `orphan` (worktree sin tarea viva,
+incluye `origin_repo_missing` si el repo ya no existe), `stale_branch` (rama sin
+worktree) y `manual_delete` (borrado vía `DELETE /tasks/:id`). `deleted` lista los
+recursos efectivamente eliminados y `errors` los fallos parciales.
+
 ## Webhooks
 
 POST JSON a `webhook_url` en cada transición de estado:

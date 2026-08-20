@@ -211,16 +211,25 @@ async function pollAgents() {
 // ---------- Hourly cleanup: idle >24h resources (tabs, worktrees, branches) ----------
 const CLEANABLE = new Set(["done", "error", "blocked"]);
 
+// One structured log line per removal, so journald tells exactly what was deleted.
+function cleanupLog(kind, info) {
+  console.log(`[cleanup] ${JSON.stringify({ at: new Date().toISOString(), kind, ...info })}`);
+}
+
 async function destroyResources(task) {
+  const deleted = [];
   const errors = [];
   if (task.tabId) {
-    try { await herdr(["tab", "close", task.tabId]); } catch (e) { errors.push(e.message); }
+    try { await herdr(["tab", "close", task.tabId]); deleted.push("tab:" + task.tabId); }
+    catch (e) { errors.push("tab: " + e.message); }
   }
-  try { await git(task.repo, ["worktree", "remove", "--force", task.worktree]); } catch (e) { errors.push(e.message); }
+  try { await git(task.repo, ["worktree", "remove", "--force", task.worktree]); deleted.push("worktree:" + task.worktree); }
+  catch (e) { errors.push("worktree: " + e.message); }
   if (task.branch) {
-    try { await git(task.repo, ["branch", "-D", task.branch]); } catch (e) { errors.push(e.message); }
+    try { await git(task.repo, ["branch", "-D", task.branch]); deleted.push("branch:" + task.branch); }
+    catch (e) { errors.push("branch: " + e.message); }
   }
-  return errors;
+  return { deleted, errors };
 }
 
 async function cleanup() {
@@ -231,10 +240,16 @@ async function cleanup() {
   for (const [id, task] of tasks) {
     if (!CLEANABLE.has(task.status)) continue;
     if (now - new Date(task.updatedAt) <= config.cleanupIdleMs) continue;
-    const errors = await destroyResources(task);
+    const idleMs = now - new Date(task.updatedAt);
+    const { deleted, errors } = await destroyResources(task);
     tasks.delete(id);
     removed++;
-    console.log(`[cleanup] task ${id} (${task.status}) removed`, errors.length ? `errors: ${errors.join("; ")}` : "");
+    cleanupLog("task", {
+      id, status: task.status, repo: task.repo, branch: task.branch,
+      worktree: task.worktree, prompt: (task.prompt || "").slice(0, 120),
+      created_at: task.createdAt, updated_at: task.updatedAt,
+      idle_hours: +(idleMs / 3600000).toFixed(2), deleted, errors,
+    });
   }
 
   // 2. Orphans: worktree dirs task-t-* with no live task (e.g. after a restart
@@ -271,18 +286,27 @@ async function cleanup() {
       } catch { continue; }
       if (repo) knownRepos.add(repo);
       if (repo && fs.existsSync(repo)) {
-        const errors = await destroyResources({
-          repo, worktree: wtPath, branch: `task/${m[1]}`, tabId: tabLabels.get(m[1]) || null,
+        const branch = `task/${m[1]}`;
+        const { deleted, errors } = await destroyResources({
+          repo, worktree: wtPath, branch, tabId: tabLabels.get(m[1]) || null,
         });
         removed++;
-        console.log(`[cleanup] orphan ${m[1]} removed`, errors.length ? `errors: ${errors.join("; ")}` : "");
+        cleanupLog("orphan", {
+          id: m[1], repo, branch, worktree: wtPath,
+          idle_hours: +((now - mtime) / 3600000).toFixed(2), deleted, errors,
+        });
       } else {
         // Origin repo is gone: drop the stale dir and tab directly.
-        try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch { /* ignore */ }
+        const deleted = [];
+        try { fs.rmSync(wtPath, { recursive: true, force: true }); deleted.push("worktree:" + wtPath); } catch { /* ignore */ }
         const tabId = tabLabels.get(m[1]);
-        if (tabId) { try { await herdr(["tab", "close", tabId]); } catch { /* ignore */ } }
+        if (tabId) { try { await herdr(["tab", "close", tabId]); deleted.push("tab:" + tabId); } catch { /* ignore */ } }
         removed++;
-        console.log(`[cleanup] orphan ${m[1]} removed (origin repo missing)`);
+        cleanupLog("orphan", {
+          id: m[1], repo, branch: `task/${m[1]}`, worktree: wtPath,
+          idle_hours: +((now - mtime) / 3600000).toFixed(2),
+          origin_repo_missing: true, deleted, errors: [],
+        });
       }
     }
   }
@@ -309,8 +333,14 @@ async function cleanup() {
       try {
         await git(repo, ["branch", "-D", branch]);
         removed++;
-        console.log(`[cleanup] stale branch ${branch} deleted`);
-      } catch (e) { console.log(`[cleanup] stale branch ${branch}: ${e.message}`); }
+        cleanupLog("stale_branch", {
+          id, repo, branch,
+          idle_hours: +((now - Number(ts) * 1000) / 3600000).toFixed(2),
+          deleted: ["branch:" + branch], errors: [],
+        });
+      } catch (e) {
+        cleanupLog("stale_branch", { id, repo, branch, deleted: [], errors: [e.message] });
+      }
     }
   }
   if (removed) saveState();
@@ -399,10 +429,14 @@ app.get("/tasks/:id/output", async (req, res) => {
 app.delete("/tasks/:id", async (req, res) => {
   const task = tasks.get(req.params.id);
   if (!task) return res.status(404).json({ error: "not found" });
-  const errors = await destroyResources(task);
+  const { deleted, errors } = await destroyResources(task);
+  cleanupLog("manual_delete", {
+    id: task.id, status: task.status, repo: task.repo, branch: task.branch,
+    worktree: task.worktree, deleted, errors,
+  });
   tasks.delete(task.id);
   saveState();
-  res.json({ deleted: task.id, errors });
+  res.json({ deleted: task.id, removed: deleted, errors });
 });
 
 // ---------- Boot ----------

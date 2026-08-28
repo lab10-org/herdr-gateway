@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { observe } from "./lib/agentState.js";
 
 const run = promisify(execFile);
 
@@ -24,6 +25,8 @@ const config = {
   cleanupIdleMs: Number(process.env.CLEANUP_IDLE_MS || 24 * 3600 * 1000),
   stateFile: process.env.STATE_FILE || "/root/.herdr/gateway-state.json",
   maxInFlight: Number(process.env.MAX_IN_FLIGHT || 4),
+  startStallMs: Number(process.env.START_STALL_MS || 15 * 60 * 1000),
+  promptWaitMs: Number(process.env.PROMPT_WAIT_MS || 120000),
 };
 if (!Number.isInteger(config.maxInFlight) || config.maxInFlight < 0) {
   console.error(`[config] invalid MAX_IN_FLIGHT "${process.env.MAX_IN_FLIGHT}", using default 4`);
@@ -93,6 +96,8 @@ function createTask({ prompt, repo, agentKind, agentArgs, branch, webhookUrl }) 
     agentKind, agentArgs, status: "queued", events: [], webhookUrl,
     tabId: null, paneId: null, promptSubmitted: false, error: null,
     doneAt: null, sessionClosed: false,
+    // `done` is gated on this: no observed work, no completion.
+    sawWorking: false, pollFailures: 0, workStartedAt: null, startingAt: null,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
   tasks.set(id, task);
@@ -150,10 +155,18 @@ async function startTask(task) {
   task.paneId = tab.root_pane.pane_id;
   await herdr(["agent", "start", id, "--kind", agentKind, "--pane", task.paneId, "--", ...agentArgs]);
   setStatus(task, "starting");
-  // agent prompt resolves once a lifecycle change is observed (~working)
-  herdr(["agent", "prompt", id, prompt])
-    .then(() => { task.promptSubmitted = true; setStatus(task, "working"); })
-    .catch((e) => fail(task, `prompt failed: ${e.message}`));
+  // Without --wait, `agent prompt` returns as soon as the keystrokes are
+  // submitted (~7ms), long before the agent has read them: reporting "working"
+  // there was fabricated. --wait is event-driven on Herdr's side, so unlike our
+  // 5s poll it cannot miss a short turn. On timeout we do NOT fail the task --
+  // it stays "starting" and the poll decides; only observed work moves it on.
+  herdr(["agent", "prompt", id, prompt,
+         "--wait", "--until", "working", "--timeout", String(config.promptWaitMs)])
+    .then(() => { task.promptSubmitted = true; armWorking(task); setStatus(task, "working"); })
+    .catch((e) => {
+      task.promptSubmitted = true;
+      log(task, `prompt submitted but "working" was not observed: ${e.message}`);
+    });
   // The task may have been deleted/cleaned up while we were starting: don't
   // leave a live agent over a destroyed worktree.
   if (!tasks.has(task.id)) {
@@ -203,6 +216,10 @@ function reconcileState() {
       t.status = "error";
       log(t, "reconciled after restart -> error");
     } else if (t.status === "working" || t.status === "blocked") {
+      // A persisted working/blocked status is itself the record that work was
+      // observed; re-arm the gate or the poll could never settle this task.
+      t.sawWorking = true;
+      t.pollFailures = 0;
       log(t, "reconciled after restart; poll will refresh status");
     }
   }
@@ -216,12 +233,21 @@ function log(task, msg) {
 function setStatus(task, status) {
   if (task.status === status) return;
   task.status = status;
+  if (status === "starting") task.startingAt = Date.now();
   if (status === "done") task.doneAt = Date.now();
   else task.doneAt = null;
   log(task, `status -> ${status}`);
   notify(task);
   // A slot freed up -> start the next queued task.
   if (!IN_FLIGHT.has(status)) dispatchQueue();
+}
+// The one place `sawWorking` is armed: `done` is unreachable until this runs.
+// Arming only -- the caller decides the status, so observing `blocked` does not
+// emit a phantom `working` on the way.
+function armWorking(task) {
+  if (task.sawWorking) return;
+  task.sawWorking = true;
+  task.workStartedAt = new Date().toISOString();
 }
 function fail(task, msg) {
   task.error = msg;
@@ -258,13 +284,24 @@ async function pollAgents() {
     try {
       const info = await herdr(["agent", "get", task.id]);
       const state = (info.agent || info).agent_status || "unknown";
-      if (state === "blocked") setStatus(task, "blocked");
-      else if (state === "idle" || state === "done") setStatus(task, "done");
-    } catch {
-      // agent name cleared -> process exited (e.g. after a gateway restart
-      // the agent may still run; poll simply cannot find it by name)
-      if (task.status === "working") setStatus(task, "done");
-      else if (task.status === "blocked") setStatus(task, "done");
+      task.pollFailures = 0;
+      // `idle` is the agent sitting at its prompt box: that is how a booting
+      // agent looks, so it can never mean completion. See lib/agentState.js.
+      const next = observe(state, task);
+      if (next.sawWorking) armWorking(task);
+      if (next.status) setStatus(task, next.status);
+    } catch (e) {
+      // A failed lookup is `unknown`, not success. Reporting `done` here handed
+      // the consumer a false completion on any Herdr hiccup.
+      task.pollFailures = (task.pollFailures || 0) + 1;
+      if (task.pollFailures === 1) log(task, `poll failed: ${e.message}`);
+      if (task.pollFailures >= 12) fail(task, `agent unreachable for ${task.pollFailures} consecutive polls`);
+    }
+    // Gating `done` on observed work means a prompt that never lands would hold
+    // an in-flight slot forever. Bound it, and report it as the error it is.
+    if (!task.sawWorking && task.status === "starting"
+        && task.startingAt && Date.now() - task.startingAt > config.startStallMs) {
+      fail(task, `agent never started working within ${Math.round(config.startStallMs / 1000)}s of dispatch`);
     }
   }
   // Close idle session tabs after TTL so follow-ups have a bounded window.
@@ -515,10 +552,18 @@ app.post("/tasks/:id/messages", async (req, res) => {
   }
   log(task, `follow-up message (${message.length} chars)`);
   task.promptSubmitted = false;
-  setStatus(task, "working");
-  herdr(["agent", "prompt", task.id, message])
-    .then(() => { task.promptSubmitted = true; })
-    .catch((e) => fail(task, `follow-up failed: ${e.message}`));
+  // Re-arm the gate: Herdr still reports `done` from the previous turn, and
+  // inheriting sawWorking would settle this follow-up on the very next poll.
+  task.sawWorking = false;
+  task.workStartedAt = null;
+  setStatus(task, "starting");
+  herdr(["agent", "prompt", task.id, message,
+         "--wait", "--until", "working", "--timeout", String(config.promptWaitMs)])
+    .then(() => { task.promptSubmitted = true; armWorking(task); setStatus(task, "working"); })
+    .catch((e) => {
+      task.promptSubmitted = true;
+      log(task, `follow-up submitted but "working" was not observed: ${e.message}`);
+    });
   res.status(202).json(publicTask(task));
 });
 

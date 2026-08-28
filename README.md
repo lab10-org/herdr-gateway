@@ -22,6 +22,8 @@ Cada tarea:
 | `WORKTREE_ROOT` | `/root/.herdr/worktrees` | Raíz de worktrees |
 | `WEBHOOK_URL` | — | Webhook global (si la tarea no define uno) |
 | `POLL_INTERVAL_MS` | `5000` | Intervalo de sondeo de estados |
+| `PROMPT_WAIT_MS` | `120000` | Espera a observar `working` tras enviar el prompt (ver *Detección de estado*) |
+| `START_STALL_MS` | `900000` (15m) | Máximo en `starting` sin trabajo observado antes de dar `error` |
 | `SESSION_IDLE_TTL_MS` | `7200000` (2h) | Tiempo que la sesión del agente queda abierta para follow-ups tras `done` |
 | `CLEANUP_INTERVAL_MS` | `3600000` (1h) | Intervalo del cleanup de recursos idle |
 | `CLEANUP_IDLE_MS` | `86400000` (24h) | Antigüedad sin interacción para que el cleanup elimine recursos |
@@ -47,10 +49,36 @@ Auth: `Authorization: Bearer <GATEWAY_TOKEN>` (todo excepto `/health`).
 ### `GET /tasks` / `GET /tasks/:id`
 Estado actual + historial de eventos.
 
-Estados: `created` → `starting` → `working` → `done` | `blocked` | `error`.
+Estados: `queued` → `dispatching` → `starting` → `working` → `done` | `blocked` | `error`.
 
 `blocked` = el agente pide aprobación/input (respóndele con `POST /tasks/:id/messages`
 o directamente en su pane de Herdr).
+
+### Detección de estado (por qué `idle` no es `done`)
+
+Herdr reporta `agent_status` ∈ `idle | working | blocked | done | unknown`. Los dos
+que importan son fáciles de confundir y significan lo opuesto:
+
+- **`idle`** — el agente está en su prompt box, sin trabajo observado. Un Claude Code
+  recién booteado está `idle`: splash, prompt todavía sin leer. Es el estado de
+  **arranque**, y nunca prueba completitud.
+- **`done`** — `idle` *después* de que Herdr observó al agente trabajando. Solo este
+  puede significar que el turno terminó.
+
+El gateway sostiene además su propia garantía: una tarea solo puede llegar a `done`
+si antes observó `working` (o `blocked`, que implica que el prompt fue leído). Sin
+esa evidencia, `done` es inalcanzable. Concretamente:
+
+- `working` se emite cuando Herdr **observa** al agente trabajando, no cuando se
+  envían las teclas: el prompt se manda con `--wait --until working`
+  (`PROMPT_WAIT_MS`), y el poll también arma la evidencia.
+- `idle` y `unknown` nunca cambian el estado de la tarea.
+- Un fallo de `herdr agent get` es `unknown`, no éxito: tras 12 polls consecutivos
+  fallidos la tarea termina en `error` (nunca en `done`).
+- Si el prompt nunca llega a arrancar, la tarea no queda colgada ocupando slot:
+  a los `START_STALL_MS` pasa a `error` explícito.
+- Un follow-up re-arma la evidencia desde cero: el `done` del turno anterior sigue
+  siendo el estado reportado por Herdr y no debe cerrar el turno nuevo.
 
 ### `POST /tasks/:id/messages`
 Continúa la conversación de una tarea: envía un mensaje de seguimiento al **mismo agente**
@@ -80,6 +108,17 @@ Transcripción reciente del agente (recent-unwrapped).
 
 ### `DELETE /tasks/:id`
 Cierra el tab en Herdr, elimina el worktree y borra la rama local.
+
+## Pruebas
+
+```bash
+npm test        # node --test, sin dependencias extra
+```
+
+`test/agentState.test.js` cubre el mapeo puro de estados (`lib/agentState.js`).
+`test/premature-done.test.js` levanta el server real contra un `herdr` falso y
+verifica de punta a punta que un agente booteando (`idle` durante ~15 ticks del
+poll) **no** emite `done`, y que `done` llega recién cuando el agente termina.
 
 ## Encolamiento
 

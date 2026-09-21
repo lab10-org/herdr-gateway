@@ -21,6 +21,7 @@ TH_MEM_PCT="${TH_MEM_PCT:-90}"          # % RAM usada
 TH_DISK_FREE_MB="${TH_DISK_FREE_MB:-5120}"   # MB libres en /
 TH_PSI_MEM="${TH_PSI_MEM:-20}"          # PSI memory some avg10
 TH_SWAP_PCT="${TH_SWAP_PCT:-50}"        # % swap usada (si hay swap)
+TH_LOAD15="${TH_LOAD15:-$(( $(nproc) * 2 ))}"  # load15 sostenido (default 2x CPUs)
 
 # Estado interno de alertas (contadores de strikes y último envío)
 declare -A STRIKES=()
@@ -130,6 +131,10 @@ while true; do
 
   [ "$caddy_up" != "active" ] && c=1 || c=0
   alert_check "caddy_down" "$c" "caddy no está activo (estado: $caddy_up)"
+
+  load_breached=0
+  awk -v v="$load15" -v th="$TH_LOAD15" 'BEGIN{exit !(v>=th)}' && load_breached=1
+  alert_check "load_high" "$load_breached" "Carga sostenida: load15=${load15} (umbral ${TH_LOAD15}, procs=${procs_total}, agentes=${agent_procs})"
 
   [ -n "${RUN_ONCE:-}" ] && exit 0   # modo test: RUN_ONCE=1 ./monitor.sh
   sleep "$INTERVAL"

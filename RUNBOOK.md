@@ -112,3 +112,36 @@ git -C <repo> worktree list              # limpiar worktrees si hace falta
 - [ ] Documentar en el consumidor: URL, token (en gestor de secretos), flujo
       `POST → poll GET → fallback`, y que `blocked` requiere intervención humana en Herdr.
 - [ ] Rotación del token: editar unit + `systemctl restart` (downtime ~1s).
+
+## 8. Hardening del host contra OOM/freeze (2026-09-21)
+
+**Incidente**: durante un pico con ~27-43 agentes vivos y >3000 procesos, la
+máquina (8 vCPU / 15.7 GiB) llegó a RAM 90%, PSI-IO 91 y load15 136, y quedó
+inmanejable → hard reboot manual. Sin alertas: los umbrales del monitor
+(mem ≥90%, 3 strikes) no se dispararon antes del freeze, y no existía alerta
+por load. La cola del gateway funcionó durante el estrés (tareas llegaron a
+`done` con carga máxima).
+
+Medidas aplicadas (host protegido ahora mismo):
+
+1. **Swap de 8 GiB** (antes 0 B): `/swapfile`, persistido en `/etc/fstab`.
+   Sin swap, un pico de RAM congela irremediablemente; ahora hay colchón.
+   Sysctl en `/etc/sysctl.d/99-herdr-oom.conf`: `vm.swappiness=10`,
+   `vm.vfs_cache_pressure=200` (recorta thrashing de cache → PSI-IO bajo).
+
+2. **earlyoom** guardián de OOM: SIGTERM al proceso más pesado cuando
+   MemAvailable <10% (~1.6 GiB) y SwapFree <10%; SIGKILL a ≤5%. Con `-p`
+   (niceness -20) reacciona bajo carga extrema. Evita matar
+   init/systemd/sshd/dbus/caddy. Config: `/etc/default/earlyoom`,
+   servicio `enabled`. Kills visibles en `journalctl -u earlyoom`.
+
+3. **Alertas más sensibles** en `herdr-monitor` (drop-in
+   `/etc/systemd/system/herdr-monitor.service.d/alerts.conf`; archivo del repo
+   en `monitor/herdr-monitor.service.d/alerts.conf`):
+   - `TH_MEM_PCT=80` (antes 90)
+   - `ALERT_STRIKES=2` (detección ~20s)
+   - Nueva alerta `load_high`: load15 ≥ 2×nproc (16 aquí)
+
+Pendiente si vuelve a pasar: límite global de agentes concurrentes,
+cgroups por sesión (MemoryMax/CPUQuota), y auto-reboot por kernel watchdog
+(`kernel.panic=10` + watchdog de la VM).
